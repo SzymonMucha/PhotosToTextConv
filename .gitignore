@@ -1,0 +1,15 @@
+# generated per-run output (SPEC 4)
+workdir/
+# user secrets
+.env
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+# tooling
+.pytest_cache/
+.ruff_cache/
+.venv/
+.idea/
