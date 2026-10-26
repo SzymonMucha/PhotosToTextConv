@@ -16,6 +16,10 @@ Polish-specific rules implemented here:
   similarity/context-overlap helpers, where the repair step legitimately
   *changes* spelling by restoring diacritics (and a dedicated share-check
   guarantees it did not silently *fold* them instead).
+
+How much may change at all is governed by :data:`ALLOWED_CHANGE_RATIO`
+(user request after noisy real-world runs: up to 35% of words per chunk may
+differ before a stage falls back - see the constant for details).
 """
 
 from __future__ import annotations
@@ -34,12 +38,33 @@ _DIACRITIC_SET = set(POLISH_DIACRITICS)
 #: Relative floor for the diacritic share (may not drop below 80% of input).
 DIACRITIC_KEEP_RATIO = 0.8
 
-#: Repair similarity thresholds (SPEC 8.3: "< 0.85, flag it").
-SIMILARITY_REJECT = 0.60   # below this the text is clearly broken -> fallback
-SIMILARITY_WARN = 0.85     # below this a warning is logged, chunk still accepted
+#: User-tuned change envelope (deliberate loosening of SPEC 8.3/9 thresholds).
+#:
+#: Photographed-book OCR is noisy, so an over-strict validator kept falling
+#: back to the (still damaged) raw text. From now on a chunk answer may differ
+#: from its input by **up to 35% of its words** (replaced, removed or added)
+#: before the stage declares the chunk broken and uses the fallback. This ONE
+#: constant drives all four meaningful limits, so they stay consistent:
+#:
+#: * repair similarity floor            : 1 - 0.35 = 0.65
+#: * formatter word-sequence threshold  : 1 - 0.35 = 0.65
+#: * repair word-count band             : +/- 35%
+#: * formatter added-word slack         : 35% of the input tokens
+#:
+#: Safety checks that are NOT affected: page markers, chatter, swallowed
+#: context blocks, language drift and the diacritic-collapse guard (they are
+#: about wrong behaviour, not about how much was changed).
+ALLOWED_CHANGE_RATIO = 0.35
 
-#: Formatter word-sequence threshold (SPEC 9): below 0.97 -> deterministic fallback.
-FORMAT_SIMILARITY_THRESHOLD = 0.97
+#: Repair similarity thresholds (SPEC 8.3 wanted "< 0.85 -> flag it"; the
+#: hard floor below which the chunk falls back is now LOOSE, see
+#: :data:`ALLOWED_CHANGE_RATIO`).
+SIMILARITY_REJECT = 1.0 - ALLOWED_CHANGE_RATIO   # 0.65: >35% changed -> fallback
+SIMILARITY_WARN = 0.85   # below this a warning is logged, chunk still accepted
+
+#: Formatter word-sequence threshold (SPEC 9 had 0.97; loosened via
+#: :data:`ALLOWED_CHANGE_RATIO` for noisy OCR): below 0.65 -> deterministic fallback.
+FORMAT_SIMILARITY_THRESHOLD = 1.0 - ALLOWED_CHANGE_RATIO
 
 #: English stopwords used ONLY for the language-drift check; deliberately
 #: excludes words that double as common Polish words (e.g. "to", "in", "it",
@@ -218,10 +243,15 @@ def check_repair_output(
 
     in_words = word_count(normalize_nfc(chunk_input))
     out_words = word_count(normalize_nfc(output))
-    if in_words and not (0.85 * in_words <= out_words <= 1.15 * in_words):
+    if in_words and not (
+        (1.0 - ALLOWED_CHANGE_RATIO) * in_words
+        <= out_words
+        <= (1.0 + ALLOWED_CHANGE_RATIO) * in_words
+    ):
         return RepairCheck(
             ok=False,
-            reason=f"word count changed beyond ±15% ({in_words} -> {out_words})",
+            reason=f"word count changed beyond ±{ALLOWED_CHANGE_RATIO:.0%} "
+            f"({in_words} -> {out_words})",
         )
 
     in_tokens_fold = tokenize(chunk_input, fold=True, drop_markers=True)
@@ -294,7 +324,8 @@ def sequence_similarity(a: list[str], b: list[str]) -> float:
 
 
 # --------------------------------------------------------------------------
-# Formatter validation (SPEC 9): word-sequence check with fallback at <0.97.
+# Formatter validation (SPEC 9): word-sequence check with a loose fallback
+# floor (35% of words may differ -> deterministic fallback below that).
 # --------------------------------------------------------------------------
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s")
 _BARE_PAGE_NUMBER_RE = re.compile(r"^\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*$")
@@ -356,10 +387,11 @@ def check_format_output(chunk_input: str, output: str) -> FormatCheck:
     added = len(out_tokens) - matched
 
     allowed_removed = count_header_like_tokens(chunk_input)
-    # Markdown syntax (---, **, #) is not tokenized, so real word additions
-    # are essentially forbidden (SPEC 9 rule 1). Only a rounding-level amount
-    # of stray tokens is tolerated, e.g. a stray list-marker digit.
-    added_slack = int(0.002 * max(len(in_tokens), 1))
+    # Markdown syntax (---, **, #) is not tokenized. Inside the loose control
+    # envelope the model may likewise add up to ALLOWED_CHANGE_RATIO of the
+    # input tokens (fixing words the OCR mangled entirely); attempts to add
+    # more than that are rejected as new content (SPEC 9 rule 1).
+    added_slack = int(ALLOWED_CHANGE_RATIO * max(len(in_tokens), 1))
 
     similarity = matched / len(in_tokens) if in_tokens else 1.0
 
@@ -370,9 +402,13 @@ def check_format_output(chunk_input: str, output: str) -> FormatCheck:
             reason=f"formatter added {added} words beyond the input "
             f"(slack {added_slack}); new content is forbidden",
         )
-    required = min(
-        len(in_tokens),
-        max(int(FORMAT_SIMILARITY_THRESHOLD * len(in_tokens)), len(in_tokens) - allowed_removed),
+    # Word-sequence envelope: all header-like tokens plus a flexible budget
+    # (ALLOWED_CHANGE_RATIO for replacements/typos the OCR left behind) may
+    # differ; anything below the resulting match floor falls back.
+    flexible_budget = int(ALLOWED_CHANGE_RATIO * max(len(in_tokens), 1))
+    required = max(
+        0,
+        len(in_tokens) - allowed_removed - flexible_budget,
     )
     if matched < required:
         return FormatCheck(
@@ -380,7 +416,7 @@ def check_format_output(chunk_input: str, output: str) -> FormatCheck:
             similarity=similarity,
             reason=(
                 f"word sequence changed: kept {matched}/{len(in_tokens)} "
-                f"(allowed to drop {allowed_removed}, "
+                f"(header-like {allowed_removed} + flexible {flexible_budget}, "
                 f"similarity {similarity:.4f} < {FORMAT_SIMILARITY_THRESHOLD})"
             ),
         )

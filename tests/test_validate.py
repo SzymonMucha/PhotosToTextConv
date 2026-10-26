@@ -101,7 +101,7 @@ def test_reordered_marker_fails():
 def test_truncated_output_fails_word_count():
     check = check_repair_output(POLISH_CHUNK, POLISH_REPAIRED[:20])
     assert not check.ok
-    assert "±15%" in check.reason
+    assert "±35%" in check.reason
 
 
 def test_chatty_output_fails():
@@ -149,19 +149,77 @@ def test_similarity_helpers():
     assert sequence_similarity(a, tokenize("raz dwa", fold=True)) > 0.5
 
 
-# ---- format validation (SPEC 9) ------------------------------------------
-def test_format_added_words_fail():
+# ---- the loose change envelope (user-tuned: 35% allowed changes) ----------
+def test_repair_changes_inside_35_percent_envelope_accepted_with_warning():
+    """~25% of words replaced: accepted, but flagged for diff review (<0.85)."""
+    chunk = page(1, " ".join(f"w{i}" for i in range(100)))
+    replaced = page(
+        1, " ".join("naprawione" if i % 4 == 0 else f"w{i}" for i in range(100))
+    )
+    check = check_repair_output(chunk, replaced, context_before="a", context_after="b")
+    assert check.ok, check.reason
+    assert any("similarity below" in w for w in check.warnings)
+
+
+def test_repair_changes_beyond_35_percent_envelope_rejected():
+    """~50% of words replaced: clear hallucination territory -> fallback."""
+    chunk = page(1, " ".join(f"w{i}" for i in range(100)))
+    replaced = page(
+        1, " ".join("naprawione" if i % 2 == 0 else f"w{i}" for i in range(100))
+    )
+    check = check_repair_output(chunk, replaced, context_before="a", context_after="b")
+    assert not check.ok
+    assert "too different" in check.reason
+
+
+def test_format_changes_inside_35_percent_envelope_pass():
+    """~34% of words rewritten but kept in order: formatter answer stands."""
+    clean = page(1, " ".join(f"w{i}" for i in range(100)))
+    changed = " ".join("inne" if i % 3 == 0 else f"w{i}" for i in range(100))
+    check = check_format_output(clean, changed)  # formatter output: no markers
+    assert check.ok, check.reason
+
+
+def test_format_changes_beyond_35_percent_envelope_fall_back():
+    clean = page(1, " ".join(f"w{i}" for i in range(100)))
+    changed = " ".join("inne" if i % 2 == 0 else f"w{i}" for i in range(100))
+    check = check_format_output(clean, changed)  # formatter output: no markers
+    assert not check.ok
+    # A 1:1 word replacement is seen by difflib as remove+add, so a
+    # beyond-envelope replacement can trip either guard first; both reasons
+    # mean "enough changed to fall back to the deterministic formatter".
+    assert "word sequence" in check.reason or "added" in check.reason
+
+
+# ---- format validation (SPEC 9, loosened to a 35% change envelope) --------
+def test_format_small_additions_within_envelope_pass():
+    # The loose envelope tolerates a few added words (e.g. a stray list
+    # marker or one word the OCR mangled): 2 added on a 10-token chunk stays
+    # inside the 35% slack, so the answer is accepted, not fallen back.
     chunk_input = page(1, "Rok dwadzieścia pierwszy.\nByła zima i padał śnieg na pola.")
-    formatted = "# Rok dwadzieścia pierwszy\n\nByła zima i padał śnieg na pola, na drogi.\n"
+    formatted = "Rok dwadzieścia pierwszy.\n\nByła zima i padał śnieg na pola, na drogi.\n"
     check = check_format_output(chunk_input, formatted)
-    assert not check.ok  # adds "na drogi" -> new words are forbidden
+    assert check.ok, check.reason
+
+
+def test_format_added_words_beyond_envelope_fail():
+    chunk_input = page(1, "Rok dwadzieścia pierwszy.\nByła zima i padał śnieg na pola.")
+    formatted = (
+        "# Rok dwadzieścia pierwszy\n\n"
+        "Była zima i padał śnieg na pola, na drogi i w głębokim mrozie.\n"
+    )
+    check = check_format_output(chunk_input, formatted)
+    assert not check.ok  # adds 6 invented words: beyond the 35% envelope
+    assert "added" in check.reason
 
 
 def test_format_added_heading_word_fails():
     chunk_input = page(1, "Była zima i padał śnieg na pola.")
-    formatted = "# Zima\n\nByła zima i padał śnieg na pola.\n"
+    # A whole invented heading phrase: too many new words even in the envelope.
+    formatted = "# Wielka Zima Bardzo Mrozna I Snezna\n\nByła zima i padał śnieg na pola.\n"
     check = check_format_output(chunk_input, formatted)
-    assert not check.ok  # "Zima" heading word does not exist in the input
+    assert not check.ok
+    assert "added" in check.reason
 
 
 def test_format_fine_passes():

@@ -140,9 +140,15 @@ workdir/
   untouched so no quota is burned pointlessly. When the quota resets, re-run the same
   command (with `-resume`, the default).
 - **Anti-hallucination checks** (see `src/book2md/validate.py`): page-marker integrity,
-  ±15 % word count, similarity (repair ≥0.60, warn <0.85; format ≥0.97), diacritic share,
-  no repeated context blocks, English-drift detection. Any failed chunk **falls back** to
-  the un-repaired resp. deterministically formatted text and logs a warning.
+  word-count band, word-sequence similarity, diacritic share, no repeated context
+  blocks, English-drift detection. The **change envelope** (how much a chunk answer may
+  differ from its OCR source) is deliberately *loose* because photographed-page OCR is
+  noisy: up to **35% of words** per chunk may be replaced, removed or added before the
+  chunk falls back (`ALLOWED_CHANGE_RATIO = 0.35` → repair/format similarity floor 0.65,
+  word count ±35%, added-word slack 35%). Stricter SPEC thresholds (0.85 repair warning,
+  format ≥0.97) were intentionally relaxed; the 0.85 similarity warning still flags
+  those mid-range answers for diff review. Any failed chunk **falls back** to the
+  un-repaired resp. deterministically formatted text and logs a warning.
 - Both `book.md` and `book.docx` are always built from **one** Markdown source
   (`03_formatted.md`), never from two independent conversions.
 
@@ -163,6 +169,13 @@ workdir/
   sending (defaults: long side 2000 px, JPEG q85, ≤ ~0.9 MB matching OCR.space free
   limits). You can tune `OCR_MAX_LONG_SIDE`, `OCR_JPEG_QUALITY`, `OCR_MAX_BYTES` in
   `.env` (see `src/book2md/config.py`).
+- **Chunks keep falling back although the LLM answer looks good** — the validator's
+  change envelope (`ALLOWED_CHANGE_RATIO = 0.35` in `src/book2md/validate.py`) limits how
+  much an answer may differ from the OCR text (35% of words). If your OCR output is
+  *very* messy, raise it (e.g. 0.45 = 45% allowed changes; 0.0 = hand-edited-quality
+  strictness), delete only the LLM cache (`rm -r workdir/<book>/cache` — keep `ocr/` so
+  pages are not re-OCR'd), and re-run: per-chunk caches ignore the thresholds, so old
+  rejected chunks must be invalidated this way.
 - **Repair chunks very slow / quota burns fast** — reduce `LLM_CONCURRENCY` to 1 or lower
   `CHUNK_WORDS`; every chunk is cached, so re-runs only pay for what failed.
 
