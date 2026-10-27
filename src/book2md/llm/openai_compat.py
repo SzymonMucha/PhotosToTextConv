@@ -122,7 +122,7 @@ class OpenAiCompatProvider(LlmProvider):
         """Pull ``choices[0].message.content`` out of the response.
 
         ``finish_reason == "length"`` means truncation; content is returned
-        anyway and the validators in :mod:`book2md.validate` reject/fallback it.
+        anyway (saved as-is for the user to review in the output file).
         """
         error = data.get("error") or {}
         if isinstance(error, dict) and error.get("message"):
@@ -138,8 +138,8 @@ class OpenAiCompatProvider(LlmProvider):
             raise PermanentError("LLM content is not text; unsupported provider response.")
         finish_reason = (choices[0] or {}).get("finish_reason")
         if finish_reason == "length":
-            # Not fatal here: truncation is caught by word-count validation and
-            # the chunk falls back to its unrepaired/unformatted variant.
+            # Not fatal here: the user can see and finish the truncated part
+            # in the output file; nothing is dropped silently.
             pass
         return content
 

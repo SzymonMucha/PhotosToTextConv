@@ -1,13 +1,11 @@
-"""Chunking for the LLM passes (SPEC 8.1, 9).
+"""Chunking for the single LLM pass.
 
-``01_raw.txt`` is cut into chunks of roughly 1,500-3,000 words (target from
-``CHUNK_WORDS``), *always* on ``<<<PAGE n>>>`` marker boundaries: a marker can
-never be separated from its page text. Missing markers are tolerated (the LLM
-adds none; the checker asks them to keep the ones that exist).
+``01_raw.txt`` is cut into chunks of roughly ``CHUNK_WORDS`` words, *always*
+on ``<<<PAGE n>>>`` marker boundaries: a marker can never be separated from
+its page text. Missing markers are tolerated.
 
-Each repair request receives the *previous chunk's last ~300 words* and the
-*next chunk's first ~300 words* as contextual reference; format requests carry
-the previous formatted tail instead (see :mod:`book2md.pipeline`).
+Each convert request carries the *previous converted chunk's last ~300 words*
+as contextual reference for paragraph continuity (see :mod:`book2md.pipeline`).
 """
 
 from __future__ import annotations
@@ -17,15 +15,14 @@ from dataclasses import dataclass
 
 #: ``<<<PAGE 12>>>`` on its own line (with tolerant surrounding whitespace).
 PAGE_MARKER_RE = re.compile(r"^[ \t]*<<<PAGE (\d+)>>>[ \t]*$", re.MULTILINE)
-#: Same regex for scanning anywhere (e.g., already-repaired text).
+#: Same regex for scanning anywhere (e.g., raw merged text).
 ANY_MARKER_RE = re.compile(r"[ \t]*<<<PAGE (\d+)>>>[ \t]*\n?")
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)  # letters/digits, not underscore
 
 
 def word_count(text: str) -> int:
-    """Count words (letters/digits runs). Markers count as 2 words; symmetric
-    on input and output so the ±15% check stays meaningful."""
+    """Count words (letters/digits runs); markers count as 2 words."""
     return len(_WORD_RE.findall(text))
 
 
@@ -39,7 +36,7 @@ class Block:
 
 @dataclass
 class Chunk:
-    """A repair/formatable unit: several blocks, sent to the LLM as one."""
+    """A convertible unit: several blocks, sent to the LLM as one."""
 
     index: int
     first_page: int | None
@@ -125,10 +122,9 @@ def split_chunks(text: str, target_words: int) -> list[Chunk]:
 def take_words(text: str, count: int, *, end: bool = False) -> str:
     """Return the first (``end=False``) or last (``end=True``) ``count`` words.
 
-    Used for CONTEXT BEFORE / CONTEXT AFTER. Markers are stripped first, so
-    context blocks never confuse the marker-keep rule. Larger ``count`` than
-    available words simply returns all words. Text is NFC-normalized by the
-    caller when embedded into prompts (see :mod:`book2md.prompts`).
+    Used for the contextual reference the prompt embeds before the text to
+    convert. Markers are stripped first, so context never contains a stray
+    marker. Larger ``count`` than available words simply returns all words.
     """
     clean = strip_page_markers(text).strip()
     words = _WORD_RE.findall(clean)
@@ -139,23 +135,3 @@ def take_words(text: str, count: int, *, end: bool = False) -> str:
     else:
         picked = words[:count]
     return " ".join(picked)
-
-
-def context_windows(
-    chunks: list[Chunk], *, context_words: int = 300
-) -> list[tuple[str, str]]:
-    """For each chunk: ``(context_before, context_after)`` texts (SPEC 8.1).
-
-    ``context_before`` is the tail of the previous chunk, ``context_after``
-    the head of the next one; the first/last chunk get empty strings.
-    """
-    windows: list[tuple[str, str]] = []
-    for i, _chunk in enumerate(chunks):
-        before = take_words(chunks[i - 1].text, context_words, end=True) if i > 0 else ""
-        after = (
-            take_words(chunks[i + 1].text, context_words, end=False)
-            if i + 1 < len(chunks)
-            else ""
-        )
-        windows.append((before, after))
-    return windows

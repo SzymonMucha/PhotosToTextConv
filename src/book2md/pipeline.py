@@ -4,21 +4,27 @@ Public entry points:
 
 * :func:`run` - the whole pipeline over a folder of photos
 * :func:`ocr_only` - stages 1-3 (order + OCR + merge)
-* :func:`repair_file` - stage 4 on an existing raw file (``book2md repair``)
-* :func:`format_file` - stage 5 on an existing text file (``book2md format``)
-* :func:`export_file` - stage 6 only (``book2md export``)
+* :func:`convert_file` - stage 4 (one LLM pass: repair + format) on an
+  existing raw text file (``book2md convert``)
+* :func:`export_file` - stage 5 only (``book2md export``)
 
-Every stage writes artifacts to disk so the user can inspect every intermediate
-result or hand-edit it; per-page OCR and per-chunk LLM caches make runs
-idempotent and resumable (SPEC 2). This module contains no UI code - progress
-is reported through a tiny :class:`Reporter` interface which the CLI adapts to
+Every stage writes artifacts to disk so the user can inspect intermediate
+results or hand-edit them; per-page OCR and per-chunk LLM caches make runs
+idempotent and resumable. This module contains no UI code - progress is
+reported through a tiny :class:`Reporter` interface which the CLI adapts to
 rich progress bars.
+
+The single LLM stage ("convert") asks the model to repair the OCR damage and
+produce Markdown in one step. There is no validator stage any more: the
+prompt itself carries the faithfulness contract (stick to the original
+words). Each answer is only *salvaged* (code fences / thinking blocks
+stripped) and stored; the sequential per-chunk flow provides the paragraph
+continuity the prompt asks for.
 """
 
 from __future__ import annotations
 
 import asyncio
-import difflib
 import json
 import re as _re
 import shutil as _shutil
@@ -29,34 +35,24 @@ from typing import Protocol
 from . import export as export_mod
 from . import llm as llm_pkg
 from . import ocr as ocr_pkg
-from .chunking import context_windows, split_chunks, take_words
+from .chunking import split_chunks, take_words
 from .config import Settings, load_settings
 from .formatting import (
     collapse_blank_lines,
-    deterministic_format,
     merge_raw_text,
     normalize_heading_levels,
     sha1_text,
+    strip_code_fences,
+    strip_model_thinking,
     write_if_changed,
 )
 from .imageprep import prepare_file
 from .ocr.base import OcrResult
 from .ordering import PageImage, order_folder, write_order_json
-from .prompts import (
-    FORMAT_SYSTEM_PROMPT,
-    REPAIR_SYSTEM_PROMPT,
-    format_user_prompt,
-    repair_user_prompt,
-)
+from .prompts import CONVERT_SYSTEM_PROMPT, convert_user_prompt
 from .retry import PermanentError, QuotaExceededError, RetriableError
-from .validate import (
-    check_format_output,
-    check_repair_output,
-    strip_code_fences,
-    strip_model_thinking,
-)
 
-#: Working-dir default: artifacts land in ``workdir/<book>/`` (SPEC 4).
+#: Working-dir default: artifacts land in ``workdir/<book>/``.
 DEFAULT_OUTPUT_DIR = "workdir"
 
 
@@ -93,7 +89,7 @@ class SilentReporter:
 
 
 # ---------------------------------------------------------------------------
-# Run summary (final "pages OK/failed, chunks..., output paths", SPEC 11)
+# Run summary (final "pages OK/failed, chunks..., output paths")
 # ---------------------------------------------------------------------------
 @dataclass
 class RunSummary:
@@ -108,10 +104,7 @@ class RunSummary:
     pages_failed: list[str] = field(default_factory=list)
     pages_empty: int = 0
     duplicates_skipped: int = 0
-    repair_chunks: int = 0
-    repair_fell_back: int = 0
-    format_chunks: int = 0
-    format_fell_back: int = 0
+    convert_chunks: int = 0
     outputs: dict[str, str] = field(default_factory=dict)
     stopped_after: str | None = None
 
@@ -283,141 +276,83 @@ def stage_merge(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: LLM repair with per-chunk cache, validation and fallback (SPEC 8)
+# Stage 4: the single LLM pass (repair + format in one), per-chunk cache
 # ---------------------------------------------------------------------------
 @dataclass
-class RepairStageResult:
+class ConvertStageResult:
     text: str
     chunks: int
-    fell_back: int
 
 
-async def repair_stage(
+async def convert_stage(
     raw_text: str,
     *,
     provider,
     cache_dir: Path,
     target_path: Path,
-    diff_path: Path,
     settings: Settings,
     reporter: Reporter,
-) -> RepairStageResult:
-    """Repair every chunk of ``raw_text``; assemble ``02_repaired.txt`` + diff.
+) -> ConvertStageResult:
+    """Convert chunks of ``raw_text`` into Markdown in ONE LLM pass.
 
-    Per SPEC 8.1: chunks run concurrently (low concurrency), every answer is
-    validated (:func:`check_repair_output`) and falls back to the unrepaired
-    chunk on any failure; the raw-vs-repaired unified diff is written for
-    review. Per-chunk caches keyed by input SHA-1 make re-runs zero-call.
+    Chunks are processed *sequentially* because each prompt carries the
+    previous chunk's converted tail: paragraphs crossing the chunk boundary
+    must flow together (the prompt asks for this explicitly). Free-tier
+    quotas stay happier this way too. Each answer is salvage-cleaned (fences
+    and thinking blocks removed) and stored in a per-chunk cache keyed by the
+    input SHA-1, so re-runs make zero LLM calls.
     """
     chunks = split_chunks(raw_text, settings.chunk_words)
-    windows = context_windows(chunks)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    semaphore = asyncio.Semaphore(settings.llm_concurrency)
-    outputs: dict[int, str] = {}
-    state = {"fell_back": 0, "cached_fallbacks": 0}
-    reporter.stage_start("repair", total=len(chunks))
+    outputs: list[str] = []
+    reporter.stage_start("convert", total=len(chunks))
+    previous_tail = ""
 
-    async def one(chunk, window) -> None:
+    for chunk in chunks:
         cache_file = cache_dir / f"chunk_{chunk.index:04d}_{sha1_text(chunk.text)}.json"
-        if cache_file.is_file():  # per-chunk cache (SPEC 8.1/resumability)
-            cached = _read_chunk_cache(cache_file)
-            if cached is not None:
-                if cached.get("source") == "fallback":
-                    state["fell_back"] += 1
-                outputs[chunk.index] = str(cached["output"])
-                reporter.stage_progress(1, detail=f"chunk {chunk.index}: cached")
-                return
-
-        context_before, context_after = window
-        prompt = repair_user_prompt(
-            text_to_repair=chunk.text,
-            context_before=context_before,
-            context_after=context_after,
-        )
-        async with semaphore:
-            answer = await provider.chat(
-                system=REPAIR_SYSTEM_PROMPT, user=prompt
-            )
-        answer = strip_model_thinking(strip_code_fences(answer))
-        check = check_repair_output(
-            chunk.text, answer, context_before=context_before, context_after=context_after
-        )
-        if check.ok:
-            accepted_output, source = answer, "llm"
+        cached = _read_chunk_cache(cache_file) if cache_file.is_file() else None
+        if cached is not None:
+            output = str(cached["output"])
+            reporter.stage_progress(1, detail=f"chunk {chunk.index}: cached")
         else:
-            # MANDATORY fallback: keep the unrepaired chunk (SPEC 8.3).
-            accepted_output, source = chunk.text, "fallback"
-            state["fell_back"] += 1
-            reporter.warning(
-                f"chunk {chunk.index}: repair rejected, keeping original ({check.reason})"
+            prompt = convert_user_prompt(
+                text_to_convert=chunk.text, context_before=previous_tail
             )
-        for warning in check.warnings:
-            reporter.warning(f"chunk {chunk.index}: {warning}")
+            answer = strip_model_thinking(
+                strip_code_fences(
+                    await provider.chat(system=CONVERT_SYSTEM_PROMPT, user=prompt)
+                )
+            )
+            output = answer
+            reporter.stage_progress(1, detail=f"chunk {chunk.index}: ok")
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "chunk": chunk.index,
+                        "pages": [chunk.first_page, chunk.last_page],
+                        "input_sha1": sha1_text(chunk.text),
+                        "output": output,
+                        "model": getattr(provider, "model", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        joined = output.strip("\n")
+        outputs.append(joined)
+        previous_tail = take_words(joined, 300, end=True)
 
-        cache_file.write_text(
-            json.dumps(
-                {
-                    "chunk": chunk.index,
-                    "pages": [chunk.first_page, chunk.last_page],
-                    "input_sha1": sha1_text(chunk.text),
-                    "output": accepted_output,
-                    "source": source,
-                    "validated": check.ok,
-                    "reason": check.reason,
-                    "model": getattr(provider, "model", ""),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        outputs[chunk.index] = accepted_output
-        reporter.stage_progress(
-            1, detail=f"chunk {chunk.index}: {'ok' if check.ok else 'fallback'}"
-        )
-
-    try:
-        async with asyncio.TaskGroup() as group:
-            for chunk, window in zip(chunks, windows):
-                group.create_task(one(chunk, window))
-    except* QuotaExceededError as excgroup:
-        raise excgroup.exceptions[0]
-
-    repaired_text = _assemble_and_write_diff(
-        raw_text, outputs, target_path, diff_path, reporter
-    )
-    return RepairStageResult(
-        text=repaired_text, chunks=len(chunks), fell_back=state["fell_back"]
-    )
-
-
-def _assemble_and_write_diff(
-    raw_text: str,
-    outputs: dict[int, str],
-    target_path: Path,
-    diff_path: Path,
-    reporter: Reporter,
-) -> str:
-    """Join chunk outputs in order, write ``02_repaired.txt`` + the diff file.
-
-    The diff (``02_repaired.diff.txt``) is a unified diff of raw vs repaired so
-    the user can review exactly what the LLM changed (SPEC 8.3).
-    """
-    repaired = "\n\n".join(str(outputs[i]).strip() for i in sorted(outputs)) + "\n"
-    changed = write_if_changed(target_path, repaired)
-    if changed:
-        diff = difflib.unified_diff(
-            raw_text.splitlines(),
-            repaired.splitlines(),
-            fromfile="01_raw.txt",
-            tofile="02_repaired.txt",
-            lineterm="",
-        )
-        write_if_changed(diff_path, "\n".join(diff) + "\n")
+    markdown = "\n\n".join(outputs) + "\n"
+    # Global cleanups after all chunks: heading-level normalization (no
+    # '#'-to-'###' jumps) and blank-line collapsing.
+    markdown = normalize_heading_levels(markdown)
+    markdown = collapse_blank_lines(markdown)
+    changed = write_if_changed(target_path, markdown)
     reporter.stage_done(
         detail=f"{target_path.name} ({'changed' if changed else 'unchanged'})"
     )
-    return repaired
+    return ConvertStageResult(text=markdown, chunks=len(chunks))
 
 
 def _read_chunk_cache(cache_file: Path) -> dict | None:
@@ -426,107 +361,6 @@ def _read_chunk_cache(cache_file: Path) -> dict | None:
         return data if "output" in data else None
     except (ValueError, KeyError, OSError):
         return None
-
-
-# ---------------------------------------------------------------------------
-# Stage 5: LLM formatting with validation + deterministic fallback (SPEC 9)
-# ---------------------------------------------------------------------------
-@dataclass
-class FormatStageResult:
-    text: str
-    chunks: int
-    fell_back: int
-
-
-async def format_stage(
-    repaired_text: str,
-    *,
-    provider,
-    cache_dir: Path,
-    target_path: Path,
-    settings: Settings,
-    reporter: Reporter,
-) -> FormatStageResult:
-    """Format chunks of ``repaired_text`` into Markdown (SPEC 9).
-
-    Chunks are processed sequentially because each request carries the previous
-    chunk's *formatted tail* for paragraph continuity (SPEC 9); concurrency
-    would break that dependency. Free-tier quotas stay happier this way too.
-    Validation is the word-sequence check; below the threshold the chunk falls
-    back to a deterministic (non-LLM) formatter.
-    """
-    chunks = split_chunks(repaired_text, settings.chunk_words)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    fell_back = 0
-    outputs: list[str] = []
-    reporter.stage_start("format", total=len(chunks))
-    previous_tail = ""
-
-    for chunk in chunks:
-        cache_file = cache_dir / f"chunk_{chunk.index:04d}_{sha1_text(chunk.text)}.json"
-        cached = _read_chunk_cache(cache_file) if cache_file.is_file() else None
-        if cached is not None:
-            output = str(cached["output"])
-            if cached.get("source") == "fallback":
-                fell_back += 1
-            reporter.stage_progress(1, detail=f"chunk {chunk.index}: cached")
-        else:
-            prompt = format_user_prompt(
-                text_to_format=chunk.text, context_before=previous_tail
-            )
-            answer = strip_model_thinking(
-                strip_code_fences(
-                    await provider.chat(system=FORMAT_SYSTEM_PROMPT, user=prompt)
-                )
-            )
-            check = check_format_output(chunk.text, answer)
-            if check.ok:
-                output, source, reason = answer, "llm", None
-            else:
-                # Deterministic, non-LLM formatter for rejected chunks (SPEC 9).
-                output, source, reason = (
-                    deterministic_format(chunk.text), "fallback", check.reason
-                )
-                fell_back += 1
-                reporter.warning(
-                    f"chunk {chunk.index}: format rejected, deterministic "
-                    f"fallback used ({check.reason})"
-                )
-            for warning in check.warnings:
-                reporter.warning(f"chunk {chunk.index}: {warning}")
-            cache_file.write_text(
-                json.dumps(
-                    {
-                        "chunk": chunk.index,
-                        "pages": [chunk.first_page, chunk.last_page],
-                        "input_sha1": sha1_text(chunk.text),
-                        "output": output,
-                        "source": source,
-                        "reason": reason,
-                        "model": getattr(provider, "model", ""),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            reporter.stage_progress(
-                1, detail=f"chunk {chunk.index}: {'ok' if source == 'llm' else 'fallback'}"
-            )
-        joined = output.strip("\n")
-        outputs.append(joined)
-        previous_tail = take_words(joined, 300, end=True)
-
-    markdown = "\n\n".join(outputs) + "\n"
-    # Global cleanups required by SPEC 9 come after all chunks: heading-level
-    # normalization (no '#' -> '###' jumps) and blank-line collapsing.
-    markdown = normalize_heading_levels(markdown)
-    markdown = collapse_blank_lines(markdown)
-    changed = write_if_changed(target_path, markdown)
-    reporter.stage_done(
-        detail=f"{target_path.name} ({'changed' if changed else 'unchanged'})"
-    )
-    return FormatStageResult(text=markdown, chunks=len(chunks), fell_back=fell_back)
 
 
 # ---------------------------------------------------------------------------
@@ -564,16 +398,15 @@ async def run(
     settings: Settings | None = None,
     reporter: Reporter | None = None,
 ) -> RunSummary:
-    """Run the full pipeline: order -> OCR -> merge -> repair -> format -> export.
+    """Run the full pipeline: order -> OCR -> merge -> convert -> export.
 
-    ``stop_after`` bounds work: ``order`` | ``ocr`` (stages 1-3) | ``repair``
-    (through ``02_repaired.txt``) | ``format`` (through ``03_formatted.md``).
-    Provider instances may be injected for tests; otherwise they are built
-    from settings (.env) lazily per stage, so stages that need no API keys
-    (e.g. ``--stop-after ocr`` must! check) still behave sensibly.
+    ``stop_after`` bounds work: ``order`` | ``ocr`` (stages 1-3) | ``convert``
+    (through ``03_formatted.md`` on raw text). Provider instances may be
+    injected for tests; otherwise they are built from settings (.env) lazily
+    per stage.
     """
-    if stop_after not in (None, "order", "ocr", "repair", "format"):
-        raise ValueError(f"invalid --stop-after {stop_after!r} (order|ocr|repair|format)")
+    if stop_after not in (None, "order", "ocr", "convert"):
+        raise ValueError(f"invalid --stop-after {stop_after!r} (order|ocr|convert)")
     settings = settings or load_settings()
     reporter = reporter or SilentReporter()
     summary = RunSummary()
@@ -643,52 +476,32 @@ async def run(
         await _close_providers(provider)
         return summary
 
-    # ----- Stage 4: LLM repair (SPEC 8) -------------------------------------
+    # ----- Stage 4: one LLM pass -> 03_formatted.md (was SPEC 8 + 9) --------
     llm = llm_provider or llm_pkg.build_llm_provider(
         settings,
         model=llm_model,
         on_retry=lambda msg: reporter.warning(msg),
         warn=reporter.warning,
     )
-    repair_result = await repair_stage(
+    convert_result = await convert_stage(
         raw_text,
         provider=llm,
-        cache_dir=workdir / "cache" / "repair",
-        target_path=workdir / "02_repaired.txt",
-        diff_path=workdir / "02_repaired.diff.txt",
-        settings=settings,
-        reporter=reporter,
-    )
-    summary.repair_chunks = repair_result.chunks
-    summary.repair_fell_back = repair_result.fell_back
-    summary.outputs["02_repaired.txt"] = str(workdir / "02_repaired.txt")
-    summary.outputs["02_repaired.diff.txt"] = str(workdir / "02_repaired.diff.txt")
-    if stop_after == "repair":
-        summary.stopped_after = stop_after
-        await _close_providers(provider, llm)
-        return summary
-
-    # ----- Stage 5: LLM formatting (SPEC 9) ---------------------------------
-    format_result = await format_stage(
-        repair_result.text,
-        provider=llm,
-        cache_dir=workdir / "cache" / "format",
+        cache_dir=workdir / "cache" / "convert",
         target_path=workdir / "03_formatted.md",
         settings=settings,
         reporter=reporter,
     )
-    summary.format_chunks = format_result.chunks
-    summary.format_fell_back = format_result.fell_back
+    summary.convert_chunks = convert_result.chunks
     summary.outputs["03_formatted.md"] = str(workdir / "03_formatted.md")
-    if stop_after == "format":
+    if stop_after == "convert":
         summary.stopped_after = stop_after
         await _close_providers(provider, llm)
         return summary
 
-    # ----- Stage 6: export .md and .docx from the same source (SPEC 10) -----
+    # ----- Stage 5: export .md and .docx from the same source (SPEC 10) -----
     reporter.stage_start("export")
     book_md, book_docx, stats = export_mod.export_book(
-        format_result.text,
+        convert_result.text,
         out_dir=workdir,
         title=title or input_dir.name,
         language=settings.book_language,
@@ -750,7 +563,7 @@ async def ocr_only(
     )
 
 
-async def repair_file(
+async def convert_file(
     raw_path: Path,
     *,
     out_dir: Path | None = None,
@@ -759,7 +572,11 @@ async def repair_file(
     settings: Settings | None = None,
     reporter: Reporter | None = None,
 ) -> RunSummary:
-    """``book2md repair RAW.txt``: stage 4 on an existing raw file (SPEC 11)."""
+    """``book2md convert RAW.txt``: the single LLM pass on an existing raw file.
+
+    Writes ``03_formatted.md`` (Markdown) next to the raw file (or into
+    ``out_dir``), with the per-chunk cache in ``.cache/`` of that directory.
+    """
     settings = settings or load_settings()
     reporter = reporter or SilentReporter()
     raw_path = Path(raw_path)
@@ -773,58 +590,15 @@ async def repair_file(
         on_retry=lambda msg: reporter.warning(msg),
         warn=reporter.warning,
     )
-    result = await repair_stage(
+    result = await convert_stage(
         raw_path.read_text(encoding="utf-8"),
         provider=llm,
-        cache_dir=out_dir / ".cache" / "repair",
-        target_path=out_dir / "02_repaired.txt",
-        diff_path=out_dir / "02_repaired.diff.txt",
-        settings=settings,
-        reporter=reporter,
-    )
-    summary.repair_chunks = result.chunks
-    summary.repair_fell_back = result.fell_back
-    summary.outputs = {
-        "02_repaired.txt": str(out_dir / "02_repaired.txt"),
-        "02_repaired.diff.txt": str(out_dir / "02_repaired.diff.txt"),
-    }
-    await _close_providers(llm)
-    return summary
-
-
-async def format_file(
-    text_path: Path,
-    *,
-    out_dir: Path | None = None,
-    llm_provider=None,
-    llm_model: str | None = None,
-    settings: Settings | None = None,
-    reporter: Reporter | None = None,
-) -> RunSummary:
-    """``book2md format TXT``: stage 5 on an existing (repaired) text file."""
-    settings = settings or load_settings()
-    reporter = reporter or SilentReporter()
-    text_path = Path(text_path)
-    if not text_path.is_file():
-        raise FileNotFoundError(f"Text file not found: {text_path}")
-    out_dir = Path(out_dir) if out_dir else text_path.parent
-    summary = RunSummary(book_name=text_path.stem)
-    llm = llm_provider or llm_pkg.build_llm_provider(
-        settings,
-        model=llm_model,
-        on_retry=lambda msg: reporter.warning(msg),
-        warn=reporter.warning,
-    )
-    result = await format_stage(
-        text_path.read_text(encoding="utf-8"),
-        provider=llm,
-        cache_dir=out_dir / ".cache" / "format",
+        cache_dir=out_dir / ".cache" / "convert",
         target_path=out_dir / "03_formatted.md",
         settings=settings,
         reporter=reporter,
     )
-    summary.format_chunks = result.chunks
-    summary.format_fell_back = result.fell_back
+    summary.convert_chunks = result.chunks
     summary.outputs = {"03_formatted.md": str(out_dir / "03_formatted.md")}
     await _close_providers(llm)
     return summary
@@ -840,7 +614,7 @@ async def export_file(
     reference_docx: Path | None = None,
     reporter: Reporter | None = None,
 ) -> RunSummary:
-    """``book2md export MD``: stage 6 only (SPEC 11)."""
+    """``book2md export MD``: export stage only (SPEC 11)."""
     reporter = reporter or SilentReporter()
     md_path = Path(md_path)
     if not md_path.is_file():
@@ -866,7 +640,7 @@ async def export_file(
 
 def _infer_source_pages(md_path: Path) -> int:
     """Standalone export: count markers from sibling artifacts when present."""
-    for sibling_name in ("02_repaired.txt", "01_raw.txt"):
+    for sibling_name in ("01_raw.txt",):
         sibling = md_path.parent / sibling_name
         if sibling.is_file():
             return len(

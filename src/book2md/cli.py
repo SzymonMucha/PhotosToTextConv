@@ -3,17 +3,16 @@
 Commands::
 
     book2md run       PHOTOS   [--title ...] [--out DIR] [--order-by ...]
-                               [--reverse] [--ocr-provider ...] [--llm-model ...]
-                               [--stop-after order|ocr|repair|format]
-                               [--resume/--no-resume] [--keep-duplicates]
+                                [--reverse] [--ocr-provider ...] [--llm-model ...]
+                                [--stop-after order|ocr|convert]
+                                [--resume/--no-resume] [--keep-duplicates]
     book2md ocr-only  PHOTOS   # stages 1-3
     book2md order     PHOTOS   # stage 1 only, prints + writes order.json
-    book2md repair    RAW.txt  # stage 4 on an existing raw file
-    book2md format    TXT      # stage 5 on an existing text file
-    book2md export    MD       # stage 6 only
+    book2md convert   RAW.txt  # stage 4: one LLM pass -> 03_formatted.md
+    book2md export    MD       # stage 5 only
 
 Every command shows rich progress per stage and a final summary: pages
-OK/failed, chunks repaired/fell back, output paths (SPEC 11).
+OK/failed, converted chunks, output paths (SPEC 11).
 """
 
 from __future__ import annotations
@@ -115,16 +114,8 @@ def print_summary(summary: RunSummary) -> None:
             f"{summary.pages_empty} empty, {summary.pages_cached} from cache "
             f"(+{summary.pages_ocr_now} fresh)"
         )
-    if summary.repair_chunks:
-        lines.append(
-            f"[bold]repair:[/bold] {summary.repair_chunks} chunk(s), "
-            f"{summary.repair_fell_back} fell back to original"
-        )
-    if summary.format_chunks:
-        lines.append(
-            f"[bold]format:[/bold] {summary.format_chunks} chunk(s), "
-            f"{summary.format_fell_back} fell back to deterministic form"
-        )
+    if summary.convert_chunks:
+        lines.append(f"[bold]convert:[/bold] {summary.convert_chunks} chunk(s)")
     for name, path in summary.outputs.items():
         lines.append(f"[bold]{name}:[/bold] {path}")
     if summary.pages_failed:
@@ -157,8 +148,8 @@ def _validate_flags(
     if order_by is not None and order_by not in ("exif", "mtime", "name"):
         console.print("[red]--order-by must be one of: exif, mtime, name[/red]")
         raise typer.Exit(code=2)
-    if stop_after is not None and stop_after not in ("order", "ocr", "repair", "format"):
-        console.print("[red]--stop-after must be one of: order, ocr, repair, format[/red]")
+    if stop_after is not None and stop_after not in ("order", "ocr", "convert"):
+        console.print("[red]--stop-after must be one of: order, ocr, convert[/red]")
         raise typer.Exit(code=2)
     if ocr_provider not in AVAILABLE_OCR_PROVIDERS:
         console.print(
@@ -218,12 +209,12 @@ def run(
     ocr_provider: str = typer.Option("ocrspace", "--ocr-provider", help="OCR provider."),
     llm_model: str | None = typer.Option(None, "--llm-model", help="LLM model override."),
     stop_after: str | None = typer.Option(
-        None, "--stop-after", help="Stop after this stage: order|ocr|repair|format."
+        None, "--stop-after", help="Stop after this stage: order|ocr|convert."
     ),
     resume: bool = _RESUME,
     keep_duplicates: bool = _KEEP_DUPES,
 ) -> None:
-    """Full pipeline: order -> OCR -> merge -> repair -> format -> export."""
+    """Full pipeline: order -> OCR -> merge -> convert (one LLM pass) -> export."""
     _validate_flags(order_by, stop_after, ocr_provider)
     summary = _execute(
         pipeline.run(
@@ -271,27 +262,14 @@ def ocr_only(
 
 
 @app.command()
-def repair(
+def convert(
     raw: Path = typer.Argument(..., exists=True, dir_okay=False, help="Raw OCR text file."),
     out: Path | None = _OUT,
     llm_model: str | None = typer.Option(None, "--llm-model", help="LLM model override."),
 ) -> None:
-    """Stage 4 on an existing raw file -> 02_repaired.txt (+ diff for review)."""
+    """Stage 4: one LLM pass (repair + format) on a raw file -> 03_formatted.md."""
     summary = _execute(
-        pipeline.repair_file(raw, out_dir=out, llm_model=llm_model, reporter=RichReporter())
-    )
-    print_summary(summary)
-
-
-@app.command()
-def format(
-    txt: Path = typer.Argument(..., exists=True, dir_okay=False, help="Repaired text file."),
-    out: Path | None = _OUT,
-    llm_model: str | None = typer.Option(None, "--llm-model", help="LLM model override."),
-) -> None:
-    """Stage 5 on an existing text file -> 03_formatted.md (Markdown)."""
-    summary = _execute(
-        pipeline.format_file(txt, out_dir=out, llm_model=llm_model, reporter=RichReporter())
+        pipeline.convert_file(raw, out_dir=out, llm_model=llm_model, reporter=RichReporter())
     )
     print_summary(summary)
 
@@ -306,7 +284,7 @@ def export(
         None, "--reference-docx", help="DOCX style template for pandoc."
     ),
 ) -> None:
-    """Stage 6 only: write book.md (front matter) and book.docx from one .md."""
+    """Stage 5 only: write book.md (front matter) and book.docx from one .md."""
     summary = _execute(
         pipeline.export_file(
             md,

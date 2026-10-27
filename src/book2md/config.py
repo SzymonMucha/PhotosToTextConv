@@ -43,7 +43,6 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_api_key: str = ""
     llm_model: str = ""
-    llm_concurrency: int = Field(default=2, ge=1, le=16)
     llm_timeout_seconds: float = 300.0
     #: Target size of one LLM chunk in words (chunks are cut on page markers).
     chunk_words: int = Field(default=2000, ge=300, le=3000)

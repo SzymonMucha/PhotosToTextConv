@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from pathlib import Path
 
@@ -21,7 +20,8 @@ class PhotoBook:
     def __init__(self, base: Path, page_count: int = 3) -> None:
         self.base = base
         self.page_count = page_count
-        for i, suffix_number in enumerate(range(page_count)):
+        for i in range(page_count):
+            # distinct colours -> distinct JPEG bytes -> no duplicate-SHA1 dedupe
             color = (i * 100, 60, 30)
             Image.new("RGB", (48, 64), color).save(base / f"IMG_{i+1}.jpg", "JPEG")
         now = time.time()
@@ -41,33 +41,25 @@ def async_run(coro):
     return asyncio.run(coro)
 
 
-def good_llm_settings(tmp_path, **kw):
+def convert_llm_settings(tmp_path, **kw):
     return make_settings(tmp_path, chunk_words=2000, **kw)
 
 
-class EchoFormat(FakeLlmProvider):
-    """Two-mode fake covering both LLM stages in one provider.
+class EchoConvert(FakeLlmProvider):
+    """Scripted single-pass converter.
 
-    - Repair prompt ([TEXT TO REPAIR]): echoes the chunk back verbatim.
-      Identical text trivially passes the similarity checks (SPEC 13).
-    - Format prompt ([TEXT TO FORMAT]): regroups lines into paragraphs,
-      which keeps every word in order (structure-only rule, SPEC 9).
+    Mirrors the prompt contract in miniature: takes the raw chunk (with
+    markers), removes the markers, keeps every word in order and groups the
+    lines into paragraphs by sentence-ending periods.
     """
 
     async def chat(self, *, system: str, user: str, temperature: float = 0.0):
         self.calls.append({"system": system, "user": user})
-        if "[TEXT TO REPAIR]" in user:
-            # Extract the repair chunk (between the repair marker and the
-            # context section) and return it unchanged, markers included.
-            chunk = user.split("[TEXT TO REPAIR]\n", 1)[1]
-            chunk = chunk.split("[CONTEXT AFTER]", 1)[0]
-            return chunk.rstrip("\n") + "\n"
-        if "[TEXT TO FORMAT]" not in user:  # unknown prompt shape: fail loudly
-            raise AssertionError("LLM prompt matches neither stage template")
-        # Cut off the template's closing "Remember:" boilerplate, otherwise the
-        # fake would format it as chunk text and the validator would rightly
-        # reject the "added words".
-        chunk = user.split("[TEXT TO FORMAT]\n", 1)[1]
+        if "[TEXT TO CONVERT]" not in user:
+            raise AssertionError("LLM prompt does not match the convert template")
+        # Cut off the template's closing "Remember:" boilerplate, otherwise
+        # the fake would convert it as chunk text.
+        chunk = user.split("[TEXT TO CONVERT]\n", 1)[1]
         chunk = chunk.split("\nRemember:", 1)[0]
         lines = [ln.strip() for ln in chunk.splitlines()]
         paras: list[str] = []
@@ -89,14 +81,14 @@ def test_full_run_produces_md_and_docx(tmp_path):
     photos.mkdir()
     book = PhotoBook(photos, page_count=3)
     ocr = book.provider()
-    settings = good_llm_settings(tmp_path)
+    settings = convert_llm_settings(tmp_path)
     summary = async_run(
         pipeline.run(
             photos,
             out_dir=tmp_path / "out",
             title="Przykladowa Ksiega",
             ocr_provider=ocr,
-            llm_provider=EchoFormat(),
+            llm_provider=EchoConvert(),
             settings=settings,
         )
     )
@@ -104,13 +96,14 @@ def test_full_run_produces_md_and_docx(tmp_path):
     for name in (
         "order.json",
         "01_raw.txt",
-        "02_repaired.txt",
-        "02_repaired.diff.txt",
         "03_formatted.md",
         "book.md",
         "book.docx",
     ):
         assert (workdir / name).exists(), f"missing artifact {name}"
+    assert not (workdir / "02_repaired.txt").exists()  # stages merged: none left
+    assert not (workdir / "02_repaired.diff.txt").exists()
+
     raw_text = (workdir / "01_raw.txt").read_text(encoding="utf-8")
     for n in (1, 2, 3):
         assert f"<<<PAGE {n}>>>" in raw_text
@@ -119,9 +112,9 @@ def test_full_run_produces_md_and_docx(tmp_path):
     assert '"Przykladowa Ksiega"' in book_md
     assert "lang: pl-PL" in book_md
     assert "<<<PAGE" not in book_md  # markers stripped before export
+    assert "Rozdział" not in book_md  # no invented headings either
     assert summary.pages_total == 3
-    assert summary.repair_fell_back == 0
-    assert summary.format_fell_back == 0
+    assert summary.convert_chunks == 1
 
 
 def test_re_run_is_fully_cached_zero_new_calls(tmp_path):
@@ -129,34 +122,37 @@ def test_re_run_is_fully_cached_zero_new_calls(tmp_path):
     photos.mkdir()
     book = PhotoBook(photos, page_count=2)
     ocr = book.provider()
-    settings = good_llm_settings(tmp_path)
+    settings = convert_llm_settings(tmp_path)
     first = async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=ocr,
-            llm_provider=EchoFormat(), settings=settings,
+            llm_provider=EchoConvert(), settings=settings,
         )
     )
     assert first.outputs
     ocr2 = book.provider()
+    llm2 = EchoConvert()
     summary2 = async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=ocr2,
-            llm_provider=EchoFormat(), settings=settings,
+            llm_provider=llm2, settings=settings,
         )
     )
-    assert ocr2.calls == []  # ZERO new OCR calls (SPEC 16 / definition of done)
+    assert ocr2.calls == []    # zero new OCR calls (cached per page)
+    assert llm2.calls == []    # zero new LLM calls (cached per chunk)
     assert summary2.pages_cached == 2
     assert summary2.pages_ocr_now == 0
 
 
-def test_stop_after_order_and_ocr(tmp_path):
+def test_stop_after_order_ocr_and_convert(tmp_path):
     photos = tmp_path / "pb"
     photos.mkdir()
     book = PhotoBook(photos, page_count=2)
+
     summary = async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
-            llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+            llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
             stop_after="order",
         )
     )
@@ -167,15 +163,25 @@ def test_stop_after_order_and_ocr(tmp_path):
     summary_ocr = async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
-            llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+            llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
             stop_after="ocr",
         )
     )
     assert (summary_ocr.workdir / "01_raw.txt").exists()
-    assert not (summary_ocr.workdir / "02_repaired.txt").exists()
+    assert not (summary_ocr.workdir / "03_formatted.md").exists()
+
+    summary_convert = async_run(
+        pipeline.run(
+            photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
+            llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
+            stop_after="convert",
+        )
+    )
+    assert (summary_convert.workdir / "03_formatted.md").exists()
+    assert not (summary_convert.workdir / "book.docx").exists()
 
 
-def test_quota_error_aborts_and_resume_continues(tmp_path):
+def test_ocr_quota_error_aborts_and_resume_continues(tmp_path):
     photos = tmp_path / "pb"
     photos.mkdir()
     book = PhotoBook(photos, page_count=3)
@@ -195,7 +201,7 @@ def test_quota_error_aborts_and_resume_continues(tmp_path):
         async_run(
             pipeline.run(
                 photos, out_dir=tmp_path / "out", ocr_provider=limited,
-                llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+                llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
             )
         )
     # page 1 cached; the rest aborted before burning quota
@@ -206,7 +212,7 @@ def test_quota_error_aborts_and_resume_continues(tmp_path):
     summary = async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
-            llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+            llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
         )
     )
     assert summary.pages_cached == 1
@@ -220,21 +226,23 @@ def test_no_resume_clears_caches(tmp_path):
     async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
-            llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+            llm_provider=EchoConvert(), settings=convert_llm_settings(tmp_path),
         )
     )
     ocr2 = book.provider()
+    llm2 = EchoConvert()
     async_run(
         pipeline.run(
             photos, out_dir=tmp_path / "out", ocr_provider=ocr2,
-            llm_provider=EchoFormat(), settings=good_llm_settings(tmp_path),
+            llm_provider=llm2, settings=convert_llm_settings(tmp_path),
             resume=False,
         )
     )
     assert len(ocr2.calls) == 2  # --no-resume re-processed everything
+    assert len(llm2.calls) == 1  # ... including the whole LLM pass
 
 
-def test_llm_quota_aborts_repair_stage_with_resume_hint(tmp_path):
+def test_llm_quota_aborts_convert_stage(tmp_path):
     photos = tmp_path / "pb"
     photos.mkdir()
     book = PhotoBook(photos, page_count=2)
@@ -247,33 +255,25 @@ def test_llm_quota_aborts_repair_stage_with_resume_hint(tmp_path):
         async_run(
             pipeline.run(
                 photos, out_dir=tmp_path / "out", ocr_provider=book.provider(),
-                llm_provider=QuotaLlm(), settings=good_llm_settings(tmp_path),
+                llm_provider=QuotaLlm(), settings=convert_llm_settings(tmp_path),
             )
         )
 
 
-def test_standalone_repair_and_format_commands(tmp_path):
+def test_standalone_convert_command(tmp_path):
     raw_path = tmp_path / "01_raw.txt"
     raw_path.write_text(
         "<<<PAGE 1>>>\nTak to zylo i dzialalo sie.\n<<<PAGE 2>>>\nkoniec bylu blisko.\n",
         encoding="utf-8",
     )
     summary = async_run(
-        pipeline.repair_file(raw_path, llm_provider=EchoFormat(),
-                             settings=good_llm_settings(tmp_path))
-    )
-    assert (tmp_path / "02_repaired.txt").exists()
-    assert (tmp_path / "02_repaired.diff.txt").exists()
-    assert summary.outputs["02_repaired.txt"].endswith("02_repaired.txt")
-
-    summary_fmt = async_run(
-        pipeline.format_file(
-            tmp_path / "02_repaired.txt", llm_provider=EchoFormat(),
-            settings=good_llm_settings(tmp_path),
-        )
+        pipeline.convert_file(raw_path, llm_provider=EchoConvert(),
+                              settings=convert_llm_settings(tmp_path))
     )
     assert (tmp_path / "03_formatted.md").exists()
-    assert summary_fmt.outputs["03_formatted.md"].endswith("03_formatted.md")
+    assert summary.outputs["03_formatted.md"].endswith("03_formatted.md")
+    md = (tmp_path / "03_formatted.md").read_text(encoding="utf-8")
+    assert "<<<PAGE" not in md
 
 
 def test_export_standalone(tmp_path):
@@ -305,60 +305,33 @@ def test_export_requires_pandoc(monkeypatch, tmp_path):
         asyncio.run(pipeline.export_file(md, title="x"))
 
 
-def test_polish_fixture_end_to_end(tmp_path):
-    """SPEC 15: diacritics survive, quotes/dashes unchanged, word sequence kept."""
+def test_polish_fixture_conversion(tmp_path):
+    """The fixtures promise: diacritics survive, quotes/dashes unchanged."""
     damaged = read_fixture("polish_damaged.txt")
-    repaired_fixture = read_fixture("polish_repaired.txt")
     formatted_fixture = read_fixture("polish_formatted.md")
 
-    # stage 4: scripted LLM returns the known-good repaired fixture
-    class FixtureRepair(FakeLlmProvider):
-        async def chat(self, *, system, user, temperature=0.0):
-            self.calls.append({"system": system, "user": user})
-            # The marker is part of the input chunk, so a faithful repair
-            # keeps it in place (SPEC 8.3 rule 5); without it the validator
-            # would reject the answer and fall back to the damaged text.
-            return f"<<<PAGE 1>>>\n{repaired_fixture}"
-
-    raw_path = tmp_path / "01_raw.txt"
-    raw_path.write_text(f"<<<PAGE 1>>>\n{damaged}", encoding="utf-8")
-    asyncio.run(
-        pipeline.repair_file(
-            raw_path, llm_provider=FixtureRepair(), settings=good_llm_settings(tmp_path)
-        )
-    )
-    repaired_out = (tmp_path / "02_repaired.txt").read_text(encoding="utf-8")
-    # diacritics restored
-    for letters in ("ą", "ę", "ł", "ż", "ó", "ś", "ń"):
-        assert letters in repaired_out
-    # Polish quotes and dialogue dashes unchanged (SPEC 15)
-    assert "„Może przyjedzie na święta”" in repaired_out
-    assert "— Nic się nie zmieniło —" in repaired_out
-    # hyphenated word joined
-    assert "poprzednia" in repaired_out and "poprzed-\n" not in repaired_out
-
-    # stage 5: scripted formatter returns known-good markdown
-    class FixtureFormat(FakeLlmProvider):
+    # the (single) LLM stage: scripted converter returns the known-good
+    # Markdown fixture directly - there is no separate repair stage any more
+    class FixtureConvert(FakeLlmProvider):
         async def chat(self, *, system, user, temperature=0.0):
             self.calls.append({"system": system, "user": user})
             return formatted_fixture
 
+    raw_path = tmp_path / "01_raw.txt"
+    raw_path.write_text(f"<<<PAGE 1>>>\n{damaged}", encoding="utf-8")
     asyncio.run(
-        pipeline.format_file(
-            tmp_path / "02_repaired.txt", llm_provider=FixtureFormat(),
-            settings=good_llm_settings(tmp_path),
+        pipeline.convert_file(
+            raw_path, llm_provider=FixtureConvert(),
+            settings=convert_llm_settings(tmp_path)
         )
     )
     md = (tmp_path / "03_formatted.md").read_text(encoding="utf-8")
     assert md.strip() == formatted_fixture.strip()
     # diacritics survive the whole pipeline
-    assert "się" in md and "żeby" in md and "Rozdział" in md
-    # Polish quotes intact: openers and closers pair up 1:1 (SPEC 15)
-    assert md.count("„") == md.count("”") > 0
+    for letter in ("ą", "ę", "ł", "ż", "ó", "ś", "ń"):
+        assert letter in md
+    # Polish quotes and dialogue dashes unchanged
     assert "„Może przyjedzie na święta”" in md
-    # word sequence preserved: token equality (casefold, diacritics kept)
-    from book2md.validate import tokenize
-
-    stripped_repaired = tokenize(repaired_fixture, drop_markers=True)
-    stripped_formatted = tokenize(formatted_fixture, drop_markers=True)
-    assert stripped_repaired == stripped_formatted
+    assert "— Nic się nie zmieniło —" in md
+    # hyphenated word was joined by the converter (fixture data)
+    assert "poprzednia" in md and "poprzed-\n" not in md

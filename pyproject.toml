@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "book2md"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turn a folder of photographed book pages into clean Markdown and DOCX: OCR -> LLM repair -> LLM formatting -> export."
 readme = "README.md"
 requires-python = ">=3.11"

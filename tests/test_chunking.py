@@ -1,11 +1,10 @@
-"""Chunking tests (SPEC 8.1): marker-boundary chunks, contexts, word limits."""
+"""Chunking tests: marker-boundary chunks, tails for context, word limits."""
 
 from __future__ import annotations
 
 import pytest
 
 from book2md.chunking import (
-    context_windows,
     split_blocks,
     split_chunks,
     strip_page_markers,
@@ -69,25 +68,6 @@ def test_chunk_target_bounds_enforced():
         split_chunks("x", target_words=100)
     with pytest.raises(ValueError):
         split_chunks("x", target_words=5000)
-
-
-def test_context_windows_are_300_word_heads_and_tails():
-    page_a = " ".join(f"a{i}" for i in range(600))
-    page_b = " ".join(f"b{i}" for i in range(600))
-    page_c = " ".join(f"c{i}" for i in range(600))
-    chunks = split_chunks(raw({1: page_a, 2: page_b, 3: page_c}), target_words=1200)
-    chunks = [c for c in chunks if c.words > 0]
-    windows = context_windows(chunks)
-    first_before, first_after = windows[0]
-    assert first_before == ""  # nothing before the first chunk
-    # chunk 2's head (300 words of page 3)
-    assert first_after.startswith("c0")
-    assert len(first_after.split()) == 300
-    middle_before, _ = windows[1]
-    assert middle_before.endswith("b599")  # tail of chunk 1 (pages 1+2!)
-    before_last, after_last = windows[-1]
-    assert after_last == ""  # nothing after the last chunk
-    assert before_last.endswith("b599")
 
 
 def test_strip_page_markers_removes_only_markers():

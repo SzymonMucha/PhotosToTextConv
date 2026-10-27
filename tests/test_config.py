@@ -19,7 +19,6 @@ def test_defaults_match_spec_env(monkeypatch):
     assert settings.ocr_language == "pol"
     assert settings.ocr_concurrency == 4
     assert settings.llm_base_url == "https://openrouter.ai/api/v1"
-    assert settings.llm_concurrency == 2
     assert settings.chunk_words == 2000
     assert settings.ocr_engine == "2"  # newer OCR.space engine by default
 
